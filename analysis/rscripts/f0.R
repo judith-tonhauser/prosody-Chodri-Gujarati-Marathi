@@ -1,5 +1,5 @@
 # Prosody of Chodri, Gujarati, Marathi
-# f0 analysis
+# f0 analysis: time series (GAMM), L/H
 
 # set working directory to directory of script
 this.dir <- dirname(rstudioapi::getSourceEditorContext()$path)
@@ -470,10 +470,6 @@ nrow(d[d$language == "Marathi",]) #15920
 write.csv(d, "../data/f0-time-series-cleaned.csv")
 nrow(d) #52090
 
-## load clean data ----
-d = read.csv("../data/f0-time-series-cleaned.csv")
-nrow(d) #52090
-
 ## Figures 3 and 4 ----
 
 # Fig 3: unnormalized f0 values over unnormalized time for sample utterance
@@ -494,13 +490,37 @@ ggplot(data=d[d$sentence == "sentence36" & d$talker == "P7" & d$cond == "predFoc
   ylab("normalized f0") 
 ggsave("../graphs/MAR-f0z-example.pdf",height=2,width=6.2)
 
+
+## load clean data ----
+d = read.csv("../data/f0-time-series-cleaned.csv")
+nrow(d) #52090
+
 ## GAMM analysis ----
 
-library(itsadug)
+# load required
+library <- c("mgcv","itsadug")
+
+# restrict analyses to utterances with LH on predicate 
+# 493 total utterances with LH predicates
+c.pred.LH <- read.csv(file="../data/Chodri-pred-LH.csv", header=TRUE, sep=",")
+nrow(c.pred.LH) #167
+g.pred.LH <- read.csv(file="../data/Gujarati-pred-LH.csv", header=TRUE, sep=",")
+nrow(g.pred.LH) #173
+m.pred.LH <- read.csv(file="../data/Marathi-pred-LH.csv", header=TRUE, sep=",")
+nrow(m.pred.LH) #153
+
+# drop the predicates that don't have LH
+d <- droplevels(subset(d,!(d$gf == "predicate" & !(d$File %in% c.pred.LH$File | d$File %in% g.pred.LH$File | d$File %in% m.pred.LH$File))))
+nrow(d) #50573
+
+# check that we have the right amount of files
+length(unique(d[d$language == "Chodri",]$File)) #152
+length(unique(d[d$language == "Gujarati",]$File)) #168
+length(unique(d[d$language == "Marathi",]$File)) #164
 
 # transform the data so that the subject/predicate combination is a time series
 
-# start getting the data in the right shape for GAMM
+# find the start events for each utterance in each language
 d <- start_event(d, event=c("File","utt"))
 head(d)
 summary(d)
@@ -508,111 +528,267 @@ summary(d)
 str(d$cond)
 str(d$talker)
 str(d$sentence)
+d$talker <- as.factor(d$talker)
+d$cond <- as.factor(d$cond)
 d$sentence <- as.factor(d$sentence)
 
-# first model to establish residuals
-m.tmp <-  bam(f0.z ~ s(Time, by = cond, bs='ad') + cond + s(Time, talker, by=cond, 
-              bs = "fs", m = 1) + s(Time, sentence, by=cond, bs = "fs", m = 1), 
-              data = d[d$language == "Marathi",], discrete = T, nthreads = 2)
-macf <- acf_resid(m.tmp)
-(rhoval <- macf[2]) #0.90
+# rename condition levels for plotting 
+d$cond <- fct_recode(d$cond, subject_focus = "subjFoc", predicate_focus = "predFoc")
+table(d$cond)
 
-m <- bam(f0.z ~ s(Time, by = cond, bs='ad') + cond + s(Time, talker, by=cond, 
-          bs = "fs", m = 1) + s(Time, sentence, by=cond, bs = "fs", m = 1), 
-         data = d[d$language == "Marathi",], discrete = T, nthreads = 2, 
-          rho=rhoval, AR.start=dm$start.event)
-(smry <- summary(m))
+# set reference level for cond to "subject_focus"
+levels(d$cond)
+d$cond <- relevel(d$cond, "subject_focus")
 
-# plot 
-pdf("../graphs/MAR-GAM-subjPred.pdf",width = 8, height = 4)
-par(mfrow=c(1,2))
-plot_smooth(m, view='Time',plot_all='cond',rm.ranef=T, rug=F, main='Utterances by condition')
-plot_diff(m, view = "Time",rm.ranef=T,comp = list(cond = c("subjFoc","predFoc")), 
-          main = "Difference subjFoc - predFoc",ylim = c(-2,2))
+# for binary and contrast models
+d$IsPredFocus <- (d$cond == "predicate_focus")*1
+d$IsPredFocusO <- as.ordered(d$IsPredFocus)
+contrasts(d$IsPredFocusO) <- 'contr.treatment'
+table(d$IsPredFocus)
+table(d$IsPredFocusO)
+
+#### Chodri ----
+
+# determine residuals, to correct for autocorrelation
+c.tmp <-  bam(f0.z ~ cond # fixed effect
+              + s(Time, by = cond, bs='ad') # smooth for fixed effect
+              + s(Time, talker, by=cond, bs = "re") # talker random effect
+              + s(Time, talker, by=cond, bs = "fs", m = 1) # talker slope
+              + s(Time, sentence, by=cond, bs = "re") # sentence random effect 
+              + s(Time, sentence, by=cond, bs = "fs", m = 1), # sentence slope
+              data = d[d$language == "Chodri",], discrete = T, nthreads = 2)
+summary(c.tmp)
+
+macf <- acf_resid(c.tmp)
+macf
+
+# to fix autocorrelation
+rhoval <- macf[2]
+rhoval # .51
+
+# model predicting f0 from condition and Time by condition (fixed effects) and
+# random effects (with slopes) for talker and sentence
+c <- bam(f0.z ~ cond # fixed effect
+         + s(Time, by = cond, bs='ad', k=60) # smooth for fixed effect
+         + s(Time, talker, by=cond, bs = "re", k=60) # talker random effect
+         + s(Time, talker, by=cond, bs = "fs", m = 1, k=60) # talker slope
+         + s(Time, sentence, by=cond, bs = "re", k=60) # sentence random effect 
+         + s(Time, sentence, by=cond, bs = "fs", m = 1, k=60), # sentence slope
+         data = d[d$language == "Chodri",], discrete = T, nthreads = 2, 
+         rho=rhoval, AR.start=d[d$language == "Chodri",]$start.event)
+#sum.m <- summary(m)
+#sum.m
+
+# check to make sure that k-index isn't lower than 1 and associated p-value small,
+# and that edf isn't too close to k' (suggests model needs to be more complex)
+gam.check(c)
+k.check(c, subsample=5000, n.rep=400)
+# k = 60
+
+# plots
+pdf(file = "../graphs/Chodri-GAMM-1.pdf",width = 4, height = 4)
+plot_smooth(c, 
+            view='Time', # name of smooth to be displayed
+            plot_all ="cond", # list of predictors to be plotted
+            rm.ranef=T, # remove random effects
+            rug=F, # F: don't plot x-axis ticks
+            hide.label=T, # hide the label (put in caption instead)
+            col=c('grey','black'),
+            legend_plot_all = NULL,
+            xlab = "normalized time",
+            ylab = "fitted values for normalized f0")
+dev.off()
+pdf(file = "../graphs/Chodri-GAMM-2.pdf",width = 4, height = 4)
+plot_diff(c, 
+          view = "Time",
+          rm.ranef=T,
+          print.summary = F,
+          hide.label = T,
+          main = "",
+          comp = list(cond = c("subject_focus","predicate_focus")),
+          xlab = "normalized time",
+          ylab = "estimated difference in normalized f0")
 dev.off()
 
-# binary model showing significance of difference
-d$IsPredFocus <- (d$cond == 'predFoc')*1
-# predFoc = 1 
-# subjFoc = 0 (sort of the reference level)
-# s(Time) models the change over time for both conditions, effectively that of subjFoc
-# s(time, by = IsPredFocus) models the difference between the two levels: if subjFoc,
-# it is identical to s(Time), if predFoc, it is the difference to s(Time)
+#### Gujarati ----
 
-mb.tmp <- bam(f0.z ~ s(Time) + s(Time, by = IsPredFocus) 
+# determine residuals, to correct for autocorrelation
+g.tmp <-  bam(f0.z ~ cond # fixed effect
+              + s(Time, by = cond, bs='ad') # smooth for fixed effect
+              + s(Time, talker, by=cond, bs = "re") # talker random effect
+              + s(Time, talker, by=cond, bs = "fs", m = 1) # talker slope
+              + s(Time, sentence, by=cond, bs = "re") # sentence random effect 
+              + s(Time, sentence, by=cond, bs = "fs", m = 1), # sentence slope
+              data = d[d$language == "Gujarati",], discrete = T, nthreads = 2)
+summary(g.tmp)
+
+macf <- acf_resid(g.tmp)
+macf
+
+# to fix autocorrelation
+rhoval <- macf[2]
+rhoval # .25
+
+# model predicting f0 from condition and Time by condition (fixed effects) and
+# random effects (with slopes) for talker and sentence
+g <- bam(f0.z ~ cond # fixed effect
+         + s(Time, by = cond, bs='ad', k=70) # smooth for fixed effect
+         + s(Time, talker, by=cond, bs = "re", k=70) # talker random effect
+         + s(Time, talker, by=cond, bs = "fs", m = 1, k=70) # talker slope
+         + s(Time, sentence, by=cond, bs = "re", k=70) # sentence random effect 
+         + s(Time, sentence, by=cond, bs = "fs", m = 1, k=70), # sentence slope
+         data = d[d$language == "Gujarati",], discrete = T, nthreads = 2, 
+         rho=rhoval, AR.start=d[d$language == "Gujarati",]$start.event)
+#sum.m <- summary(m)
+#sum.m
+
+# check to make sure that k-index isn't lower than 1 and associated p-value small,
+# and that edf isn't too close to k' (suggests model needs to be more complex)
+gam.check(g)
+k.check(g, subsample=5000, n.rep=400)
+# k = 70 (k-index still below 1)
+
+# plots
+pdf(file = "../graphs/Gujarati-GAMM-1.pdf",width = 4, height = 4)
+plot_smooth(g, 
+            view='Time', # name of smooth to be displayed
+            plot_all ="cond", # list of predictors to be plotted
+            rm.ranef=T, # remove random effects
+            rug=F, # F: don't plot x-axis ticks
+            hide.label=T, # hide the label (put in caption instead)
+            col=c('grey','black'),
+            legend_plot_all = NULL,
+            xlab = "normalized time",
+            ylab = "fitted values for normalized f0")
+dev.off()
+pdf(file = "../graphs/Gujarati-GAMM-2.pdf",width = 4, height = 4)
+plot_diff(g, 
+          view = "Time",
+          rm.ranef=T,
+          print.summary = F,
+          hide.label = T,
+          main = "",
+          comp = list(cond = c("subject_focus","predicate_focus")),
+          xlab = "normalized time",
+          ylab = "estimated difference in normalized f0")
+dev.off()
+
+#### Marathi ----
+
+# determine residuals, to correct for autocorrelation
+m.tmp <-  bam(f0.z ~ cond # fixed effect
+              + s(Time, by = cond, bs='ad') # smooth for fixed effect
+              + s(Time, talker, by=cond, bs = "re") # talker random effect
+              + s(Time, talker, by=cond, bs = "fs", m = 1) # talker slope
+              + s(Time, sentence, by=cond, bs = "re") # sentence random effect 
+              + s(Time, sentence, by=cond, bs = "fs", m = 1), # sentence slope
+              data = d[d$language == "Marathi",], discrete = T, nthreads = 2)
+summary(m.tmp)
+
+macf <- acf_resid(m.tmp)
+macf
+
+# to fix autocorrelation
+rhoval <- macf[2]
+rhoval # .9
+
+# model predicting f0 from condition and Time by condition (fixed effects) and
+# random effects (with slopes) for talker and sentence
+m <- bam(f0.z ~ cond # fixed effect
+         + s(Time, by = cond, bs='ad', k=30) # smooth for fixed effect
+         + s(Time, talker, by=cond, bs = "re", k=30) # talker random effect
+         + s(Time, talker, by=cond, bs = "fs", m = 1, k=30) # talker slope
+         + s(Time, sentence, by=cond, bs = "re", k=30) # sentence random effect 
+         + s(Time, sentence, by=cond, bs = "fs", m = 1, k=30), # sentence slope
+         data = d[d$language == "Marathi",], discrete = T, nthreads = 2, 
+         rho=rhoval, AR.start=d[d$language == "Marathi",]$start.event)
+#sum.m <- summary(m)
+#sum.m
+
+# check to make sure that k-index isn't lower than 1 and associated p-value small,
+# and that edf isn't too close to k' (suggests model needs to be more complex)
+gam.check(m)
+k.check(m, subsample=5000, n.rep=400)
+# k = 30
+
+# plots
+pdf(file = "../graphs/Marathi-GAMM-1.pdf",width = 4, height = 4)
+plot_smooth(m, 
+            view='Time', # name of smooth to be displayed
+            plot_all ="cond", # list of predictors to be plotted
+            rm.ranef=T, # remove random effects
+            rug=F, # F: don't plot x-axis ticks
+            hide.label=T, # hide the label (put in caption instead)
+            col=c('grey','black'),
+            legend_plot_all = NULL,
+            xlab = "normalized time",
+            ylab = "fitted values for normalized f0")
+dev.off()
+pdf(file = "../graphs/Marathi-GAMM-2.pdf",width = 4, height = 4)
+plot_diff(m, 
+          view = "Time",
+          rm.ranef=T,
+          print.summary = F,
+          hide.label = T,
+          main = "",
+          comp = list(cond = c("subject_focus","predicate_focus")),
+          xlab = "normalized time",
+          ylab = "estimated difference in normalized f0")
+dev.off()
+
+# fit binary model to investigate whether non-linear difference is significant 
+mb.tmp <- bam(f0.z ~ s(Time) 
+          + s(Time, by = IsPredFocus) 
+          + s(Time, talker, by=IsPredFocus, bs = "re")
           + s(Time, talker, by=IsPredFocus, bs = "fs", m = 1)
+          + s(Time, sentence, by=IsPredFocus, bs = "re")
           + s(Time, sentence, by=IsPredFocus, bs = "fs", m = 1),
           data = d[d$language == "Marathi",], discrete = T, nthreads = 2)
 
 macf <- acf_resid(mb.tmp)
-(rhoval <- macf[2]) #0.93
+(rhoval <- macf[2]) #0.90
 
-mb <- bam(f0.z ~ s(Time) + s(Time, by = IsPredFocus) 
-          + s(Time, talker, by=IsPredFocus, bs = "fs", m = 1)
-          + s(Time, sentence, by=IsPredFocus, bs = "fs", m = 1),
+mb <- bam(f0.z ~ s(Time, k=50) 
+          + s(Time, by = IsPredFocus, k=30)
+          + s(Time, talker, by=IsPredFocus, bs = "re", k=30)
+          + s(Time, talker, by=IsPredFocus, bs = "fs", m = 1, k=30)
+          + s(Time, sentence, by=IsPredFocus, bs = "re", k=30)
+          + s(Time, sentence, by=IsPredFocus, bs = "fs", m = 1, k=30),
            data = d[d$language == "Marathi",], discrete = T, nthreads = 2, rho=rhoval, 
            AR.start=d[d$language == "Marathi",]$start.event)
-(smry.mb <- summary(mb))
+sum.mb <- summary(mb)
+sum.mb
+# s(Time):IsPredFocus          8.855e+00   9.821  2.468 0.00677 ** 
+# the non-linear pattern for the difference between the two conditions is significant
 
-# ordered factor model
-d$IsPredFocusO <- as.ordered(d$IsPredFocus) #creates an ordered factor
-contrasts(d$IsPredFocusO) <- 'contr.treatment'
-# using a contrast treatment ensures that predFoc = 1 and subjFoc = 0 (the reference level)
-
-# ordered factor model showing significance of difference separately for constant difference and non-linear difference
-mo.tmp <- bam(f0.z ~ s(Time) + s(Time, by = IsPredFocusO) 
-           + IsPredFocusO 
-           +  s(Time, talker, by=IsPredFocusO, bs = "fs", m = 1)
-           +  s(Time, sentence, by=IsPredFocusO, bs = "fs", m = 1), 
+# fit ordered factor model to investigate whether intercept and/or non-linear difference are different
+mo.tmp <- bam(f0.z ~ IsPredFocusO 
+           + s(Time) 
+           + s(Time, by = IsPredFocusO) 
+           + s(Time, talker, by=IsPredFocus, bs = "re")
+           + s(Time, talker, by=IsPredFocus, bs = "fs", m = 1)
+           + s(Time, sentence, by=IsPredFocus, bs = "re")
+           + s(Time, sentence, by=IsPredFocus, bs = "fs", m = 1),
            data = d[d$language == "Marathi",], discrete = T, nthreads = 2)
 macf <- acf_resid(mo.tmp)
-(rhoval <- macf[2]) #0.93
+rhoval <- macf[2] 
+rhoval #0.90
 
-mo <- bam(f0.z ~ s(Time) + s(Time, by = IsPredFocusO) 
-           + IsPredFocusO 
-           +  s(Time, talker, by=IsPredFocusO, bs = "fs", m = 1)
-           +  s(Time, sentence, by=IsPredFocusO, bs = "fs", m = 1), 
-           data = d[d$language == "Marathi",], discrete = T, nthreads = 2, rho=rhoval, 
+mo <- bam(f0.z ~ IsPredFocusO 
+          + s(Time, k=30) 
+          + s(Time, by = IsPredFocusO, k=30) 
+          + s(Time, talker, by=IsPredFocus, bs = "re", k=30)
+          + s(Time, talker, by=IsPredFocus, bs = "fs", m = 1, k=30)
+          + s(Time, sentence, by=IsPredFocus, bs = "re", k=30)
+          + s(Time, sentence, by=IsPredFocus, bs = "fs", m = 1, k=30),
+          data = d[d$language == "Marathi",], discrete = T, nthreads = 2, rho=rhoval, 
            AR.start=d[d$language == "Marathi",]$start.event)
-(smry.mo <- summary(mo))
-# intercept is n.s: two conditions do not differ in constant difference (intercept)
-# s(Time):IsPredFoc01 ***: two conditions differ in non-linear difference
-
-# do the same on the subset of data where the predicate has a LH
-tmp <- d
-predTone <- read.csv(file="../data/Marathi-pred-LH.csv", header=TRUE, sep=",")
-nrow(predTone) #153
-head(predTone)
-
-table(tmp$gf)
-
-tmp <- droplevels(subset(tmp,tmp$File %in% predTone$File))
-table(tmp$gf)
-
-dm.LH <- tmp
-
-# first model to establish residuals
-m.tmp <-  bam(f0.z ~ s(Time, by = cond, bs='ad') + cond 
-              + s(Time, talker, by=cond, bs = "fs", m = 1) 
-              + s(Time, sentence, by=cond, bs = "fs", m = 1), 
-              data = dm.LH, discrete = T, nthreads = 2)
-macf <- acf_resid(m.tmp)
-(rhoval <- macf[2]) #0.9
-
-m <- bam(f0.z ~ s(Time, by = cond, bs='ad') + cond 
-         + s(Time, talker, by=cond, bs = "fs", m = 1) 
-         + s(Time, sentence, by=cond, bs = "fs", m = 1), 
-         data = dm.LH, discrete = T, nthreads = 2, 
-         rho=rhoval, AR.start=dm.LH$start.event)
-(smry <- summary(m))
-
-# plot 
-pdf("../graphs/MAR-GAM-subjPredLH.pdf",width = 8, height = 4)
-par(mfrow=c(1,2))
-plot_smooth(m, view='Time',plot_all='cond',rm.ranef=T, rug=F, main='Utterances by condition')
-plot_diff(m, view = "Time",rm.ranef=T,comp = list(cond = c("subjFoc","predFoc")), 
-          main = "Focus difference (LH on predicate)",ylim = c(-2,2))
-dev.off()
+sum.mo <- summary(mo)
+sum.mo
+# IsPredFocusO1  IsPredFocusO1  0.03649    0.06755   0.540    0.589
+# s(Time):IsPredFocusO1        7.932e+00   8.947   2.716 0.00392 ** 
+# no difference in intercept
+# non-linear difference
 
 # LH analysis ====
 
